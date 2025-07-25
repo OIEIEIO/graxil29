@@ -1,0 +1,94 @@
+# Project metadata - Package information and build configuration
+[package]
+name = "graxil29"                                            # 📦 Package name for Grin mining
+version = "0.4.2"                                           # 🏷️ Updated version for nonce count and error fixes
+edition = "2024"                                            # 🦀 Rust edition (latest features)
+authors = ["Your Name <email@example.com>"]                 # 👥 Package authors
+description = "Modern Rust Grin miner for Cuckaroo29 algorithm" # 📝 Package description
+license = "Apache-2.0"                                      # ⚖️ Open source license
+repository = "https://github.com/yourusername/graxil29"     # 🔗 Source code repository
+keywords = ["crypto", "grin", "mining", "cuckaroo29", "gpu"] # 🏷️ Search keywords
+rust-version = "1.85"                                       # 🦀 Minimum Rust version required
+
+# Binary target - Main executable configuration
+[[bin]]
+name = "graxil29"                                            # 🎯 Executable name
+path = "src/main.rs"                                         # 📁 Entry point file
+
+[dependencies]
+# Async runtime - Core async/await support
+tokio = { version = "1", features = ["full"] }    # 🚀 Full async runtime with all features
+futures = "0.3"                                   # 📡 Future combinators and utilities
+
+# Date/time - For timestamps
+chrono = { version = "0.4", features = ["serde"] } # 🕒 Date and time handling
+
+# GPU compute - OpenCL backend (NEW: Real Cuckoo Cycle mining)
+ocl = "0.19"                                       # 🆕 OpenCL bindings for GPU compute
+hashbrown = "0.7"                                 # 🆕 Fast HashMap for cycle detection
+blake2-rfc = "0.2"                                # 🆕 Blake2b for SipHash key generation
+byteorder = "1"                                   # 🆕 Endian conversions for SipHash
+
+# GPU compute - WGSL (LEGACY: Will be removed after OpenCL transition)
+wgpu = { version = "0.20", features = ["wgsl"] }  # 🔄 WebGPU with WGSL shader support
+pollster = "0.3"                                  # 🔄 Async executor for wgpu
+bytemuck = { version = "1", features = ["derive"] } # 🔄 Safe transmutation for GPU data
+
+# Crypto & hashing - Core cryptographic functions
+blake2 = "0.10"                                   # 🔐 Blake2 hashing (general purpose)
+siphasher = "1.0"                                 # 🔐 SipHash implementation
+rand = "0.8"                                      # 🎲 Random number generation
+
+# Networking & JSON - Pool communication
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false } # 🌐 HTTP client with TLS
+serde = { version = "1.0", features = ["derive"] } # 📝 Serialization framework (added for JobTemplate)
+serde_json = "1.0"                                # 📝 JSON serialization
+url = "2.5"                                       # 🔗 URL parsing and manipulation
+
+# Config & CLI - User interface and configuration  
+toml = "0.8"                                      # ⚙️ TOML configuration parsing
+clap = { version = "4", features = ["derive"] }   # 🖥️ Command line argument parsing
+
+# Logging & metrics - Observability and debugging
+tracing = "0.1"                                   # 📊 Structured logging framework
+tracing-subscriber = { version = "0.3", features = ["env-filter"] } # 📊 Log output and filtering
+
+# Error handling - Robust error management
+thiserror = "1.0"                                 # ❌ Derive macro for custom errors
+anyhow = "1.0"                                    # ❌ Flexible error handling
+
+# Utilities - Helper functions and data structures
+uuid = { version = "1", features = ["v4"] }       # 🆔 UUID generation for mining sessions
+hex = "0.4"                                       # 🔢 Hexadecimal encoding/decoding
+nvml-wrapper = "0.11.0"                           # 🎯 NVIDIA GPU memory detection
+
+[dev-dependencies]
+# Testing and benchmarking - Development tools
+criterion = { version = "0.5", features = ["html_reports"] } # 📈 Performance benchmarking with HTML reports
+tokio-test = "0.4"                                           # 🧪 Testing utilities for async code
+
+# Benchmark configuration - Performance measurement
+[[bench]]
+name = "cuckaroo29"                                          # 🏃 Cuckaroo29 algorithm benchmarks
+harness = false                                              # Use criterion instead of built-in harness
+
+# Build profiles - Optimization settings
+[profile.release]
+opt-level = 3                                                # 🚀 Maximum optimization for production
+lto = true                                                   # 🔗 Link-time optimization
+codegen-units = 1                                            # 📦 Single codegen unit for better optimization
+panic = "abort"                                              # 💥 Abort on panic (smaller binary)
+
+[profile.bench]
+opt-level = 3                                                # 🚀 Maximum optimization for benchmarks
+debug = true                                                 # 🐛 Keep debug symbols for profiling
+
+[profile.dev]
+opt-level = 1                                                # ⚡ Some optimization for faster development
+
+# Feature flags - Conditional compilation
+[features]
+default = ["opencl"]                                         # 🎯 Enable OpenCL backend by default
+opencl = []                                                  # 🆕 Real Cuckoo Cycle mining with OpenCL
+profile = []                                                 # 📊 Enable kernel profiling
+wgsl-fallback = []                                           # 🔄 Keep WGSL as fallback during transition

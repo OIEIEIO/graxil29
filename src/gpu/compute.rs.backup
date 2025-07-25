@@ -1,0 +1,381 @@
+//! GPU compute pipeline for Cuckaroo29 mining
+
+use wgpu::{
+    Device, Queue, Instance, BufferUsages, ComputePipeline,
+    BindGroupLayout,
+};
+use std::sync::Arc;
+use crate::Graxil29Error;
+
+/// GPU compute context for Cuckaroo29 mining
+pub struct GpuCompute {
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    edge_generation_pipeline: ComputePipeline,
+    cycle_detection_pipeline: ComputePipeline,
+    bind_group_layout: BindGroupLayout,
+}
+
+impl GpuCompute {
+    /// Create a new GPU compute instance
+    pub async fn new() -> Result<Self, Graxil29Error> {
+        // Initialize wgpu
+        let instance = Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            ..Default::default()
+        });
+
+        // Request adapter (GPU)
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .ok_or_else(|| Graxil29Error::Gpu("No suitable GPU adapter found".to_string()))?;
+
+        // Log GPU info
+        let info = adapter.get_info();
+        tracing::info!("Using GPU: {} ({:?})", info.name, info.backend);
+
+        // Request device and queue
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("Graxil29 GPU Device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits {
+                        max_compute_workgroup_size_x: 1024,
+                        max_compute_workgroup_size_y: 1024,
+                        max_compute_workgroup_size_z: 64,
+                        max_compute_invocations_per_workgroup: 1024,
+                        max_compute_workgroup_storage_size: 32768,
+                        ..Default::default()
+                    },
+                },
+                None,
+            )
+            .await
+            .map_err(|e| Graxil29Error::Gpu(format!("Failed to create device: {}", e)))?;
+
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        // Create compute shaders
+        let edge_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Cuckaroo29 Edge Generation"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("kernels/cuckaroo29.wgsl").into()),
+        });
+
+        // Create bind group layout
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Cuckaroo29 Bind Group Layout"),
+            entries: &[
+                // Header hash buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Nonce buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Edge output buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Solutions buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // Create compute pipelines
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Cuckaroo29 Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let edge_generation_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Edge Generation Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &edge_shader,
+            entry_point: "generate_edges",
+            compilation_options: Default::default(),
+        });
+
+        let cycle_detection_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Cycle Detection Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &edge_shader,
+            entry_point: "find_cycles",
+            compilation_options: Default::default(),
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            edge_generation_pipeline,
+            cycle_detection_pipeline,
+            bind_group_layout,
+        })
+    }
+
+    /// Mine with GPU acceleration
+    pub async fn mine_cuckaroo29(
+        &self,
+        header_hash: &[u8; 32],
+        start_nonce: u64,
+        nonce_count: u64,
+    ) -> Result<Vec<(u64, [u32; 42])>, Graxil29Error> {
+        tracing::info!("Starting GPU mining: {} nonces", nonce_count);
+
+        // Calculate buffer sizes for GPU limits (256MB max)
+        let max_edges_per_batch = 10_000_000; // ~120MB per batch (much smaller)
+        let batch_size = std::cmp::min(nonce_count, 256); // Process 256 nonces at once
+
+        let mut solutions = Vec::new();
+
+        for batch_start in (0..nonce_count).step_by(batch_size as usize) {
+            let current_batch_size = std::cmp::min(batch_size, nonce_count - batch_start);
+            
+            let batch_solutions = self.mine_batch(
+                header_hash,
+                start_nonce + batch_start,
+                current_batch_size,
+                max_edges_per_batch,
+            ).await?;
+            
+            solutions.extend(batch_solutions);
+            
+            if batch_start % 10000 == 0 {
+                tracing::info!("Processed {} nonces, found {} solutions", 
+                    batch_start + current_batch_size, solutions.len());
+            }
+        }
+
+        Ok(solutions)
+    }
+
+    async fn mine_batch(
+        &self,
+        header_hash: &[u8; 32],
+        start_nonce: u64,
+        nonce_count: u64,
+        max_edges: usize,
+    ) -> Result<Vec<(u64, [u32; 42])>, Graxil29Error> {
+        // Create GPU buffers
+        let header_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Header Buffer"),
+            size: 32,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Copy header data
+        self.queue.write_buffer(&header_buffer, 0, header_hash);
+
+        let nonce_data: Vec<u32> = (start_nonce..start_nonce + nonce_count)
+            .map(|n| n as u32)
+            .collect();
+        let nonce_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nonce Buffer"),
+            size: (nonce_data.len() * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Copy nonce data
+        self.queue.write_buffer(&nonce_buffer, 0, bytemuck::cast_slice(&nonce_data));
+
+        // Edge buffer (u, v, index) * max_edges - much smaller now
+        let edge_buffer_size = max_edges * 3 * std::mem::size_of::<u32>();
+        let edge_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Edge Buffer"),
+            size: edge_buffer_size as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Solution buffer (nonce + 42 edge indices) * max solutions - smaller
+        let max_solutions = 100; // Reduced from 1000
+        let solution_buffer_size = max_solutions * (1 + 42) * std::mem::size_of::<u32>();
+        let solution_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Solution Buffer"),
+            size: solution_buffer_size as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Create bind group
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Cuckaroo29 Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: header_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: nonce_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: edge_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: solution_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Execute compute shader
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Cuckaroo29 Compute Encoder"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Cuckaroo29 Compute Pass"),
+                timestamp_writes: None,
+            });
+
+            // Edge generation pass
+            compute_pass.set_pipeline(&self.edge_generation_pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            
+            let workgroup_size = 256;
+            let num_workgroups = (max_edges + workgroup_size - 1) / workgroup_size;
+            compute_pass.dispatch_workgroups(num_workgroups as u32, 1, 1);
+
+            // Cycle detection pass
+            compute_pass.set_pipeline(&self.cycle_detection_pipeline);
+            compute_pass.dispatch_workgroups((nonce_count + workgroup_size as u64 - 1) as u32 / workgroup_size as u32, 1, 1);
+        }
+
+        // Submit commands
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back solutions
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer"),
+            size: solution_buffer_size as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Copy Encoder"),
+        });
+        encoder.copy_buffer_to_buffer(&solution_buffer, 0, &staging_buffer, 0, solution_buffer_size as u64);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Map and read results
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver.await.unwrap()
+            .map_err(|e| Graxil29Error::Gpu(format!("Failed to map buffer: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let solution_data: &[u32] = bytemuck::cast_slice(&data);
+
+        // Parse solutions
+        let mut solutions = Vec::new();
+        let mut offset = 0;
+        
+        while offset < solution_data.len() && solution_data[offset] != 0 {
+            let nonce = solution_data[offset] as u64;
+            offset += 1;
+            
+            if offset + 42 <= solution_data.len() {
+                let mut cycle = [0u32; 42];
+                cycle.copy_from_slice(&solution_data[offset..offset + 42]);
+                solutions.push((nonce, cycle));
+                offset += 42;
+            } else {
+                break;
+            }
+        }
+
+        Ok(solutions)
+    }
+}
+    /// Mine Cuckaroo29 algorithm on GPU
+    pub async fn mine_cuckaroo29(
+        &self,
+        header_hash: [u8; 32],
+        start_nonce: u64,
+        nonce_count: u64,
+        difficulty: u64,
+    ) -> Result<Vec<crate::algorithms::cuckaroo29::Solution>, crate::Graxil29Error> {
+        tracing::info!("Starting GPU mining: {} nonces", nonce_count);
+        
+        // For now, use the existing compute method and convert solutions
+        let mut solutions = Vec::new();
+        
+        // Process in batches to avoid memory limits
+        let batch_size = 1000;
+        for batch_start in (0..nonce_count).step_by(batch_size as usize) {
+            let batch_end = std::cmp::min(batch_start + batch_size, nonce_count);
+            let batch_count = batch_end - batch_start;
+            
+            // Run the GPU computation
+            let batch_solutions = self.compute_edges(header_hash, start_nonce + batch_start, batch_count).await?;
+            
+            // Convert to Solution format
+            for (i, found) in batch_solutions.iter().enumerate() {
+                if *found {
+                    let nonce = start_nonce + batch_start + i as u64;
+                    solutions.push(crate::algorithms::cuckaroo29::Solution {
+                        nonce,
+                        edges: vec![0; 42], // Placeholder - would contain actual cycle
+                    });
+                }
+            }
+            
+            if batch_start % 10000 == 0 {
+                tracing::debug!("Processed batch {}/{}", batch_start, nonce_count);
+            }
+        }
+        
+        tracing::info!("Processed {} nonces, found {} solutions", nonce_count, solutions.len());
+        Ok(solutions)
+    }
+}
