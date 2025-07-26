@@ -1,63 +1,51 @@
 // src/gpu/compute.rs - OpenCL compute pipeline for multi-algorithm Graxil29 mining
-// Tree location: ./src/gpu/compute.rs
 
-//! OpenCL-based GPU compute pipeline for multi-algorithm Graxil29 mining
-//! 
-//! Provides real Cuckoo Cycle implementation using proven OpenCL algorithms.
-//! Supports both Cuckaroo29 and Cuckatoo32 with automatic GPU detection,
-//! memory management, and algorithm-specific optimizations.
-//! 
-//! # Version History
-//! - 0.1.0: Initial GPU compute implementation (WGSL mock solutions)
-//! - 0.2.0: Added accurate VRAM detection using nvml-wrapper for NVIDIA  
-//! - 0.3.0: Added proper GPU solution readback, removed mock solutions
-//! - 0.4.0: Fixed Cuckatoo32 submission format and edge index calculation
-//! - 0.5.0: **MAJOR**: Complete rewrite using OpenCL backend for real mining
-//! - 0.5.1: Enhanced multi-platform support and performance monitoring
-//! - 0.5.2: Fixed compilation errors and benchmark implementation
-//! - 0.5.3: **CRITICAL FIX**: Pass difficulty parameter to OpenCL backend
-//! - 0.5.4: **MAJOR FIX**: Fixed difficulty calculation and added share difficulty display
-//! - 0.5.5: **MAJOR FIX**: Replaced placeholder hash with BLAKE2b-512 for pool-compatible difficulty
-//! - 0.5.6: Added debug logging for raw and scaled difficulties to diagnose pool difficulty mismatch
-//! - 0.5.7: Adjusted scaling factor and added test case with real pool job header
-//! - 0.5.8: Updated difficulty calculation to hash sorted cycle edges only, per Grin’s method
-//! - 0.5.9: Removed scaling factor, using raw difficulty directly, and tested sorted/unsorted edge encoding
-//! - 0.5.10: Switched to unsorted cycle edges for Aeternity, removed scaling, per GMiner’s raw difficulty
-//! - 0.5.11: Made nonce count configurable via CLI for pool mining
+//! # Graxil29 GPU Compute Pipeline
+//!
+//! OpenCL-based GPU compute pipeline for Cuckaroo29 and Cuckatoo32 mining.
+//! Provides real Cuckoo Cycle implementation, automatic device/memory management, job scheduling, and pool-difficulty filtering.
+//!
+//! ## Features
+//! - Real OpenCL backend (via OpenClBackend)
+//! - Algorithm auto-detect based on VRAM
+//! - Pool job tracking
+//! - Share difficulty calculation (BLAKE2b-512)
+//! - Full stats reporting & memory info
+//! - Pool-agnostic share formatting
 
 use nvml_wrapper::Nvml;
-use crate::{Graxil29Error, algorithms::{Algorithm, Solution}};
-use crate::gpu::opencl::{
-    OpenClBackend, OpenClConfig, GpuVendor, DeviceCapabilities, MemoryUsage
+use crate::{
+    Graxil29Error,
+    algorithms::{Algorithm, Solution},
+    gpu::opencl::{OpenClBackend, OpenClConfig, GpuVendor, DeviceCapabilities, MemoryUsage}
 };
 use blake2::{Blake2b512, Digest};
-use hex::decode;
 
-/// GPU memory information for algorithm selection
+/// Information about GPU VRAM and memory limits for algorithm selection.
 #[derive(Debug, Clone)]
 pub struct GpuMemoryInfo {
-    /// Total GPU memory in bytes
+    /// Total GPU memory in bytes.
     pub total_memory: u64,
-    /// Available memory for mining in bytes  
+    /// Available memory for mining in bytes.
     pub available_memory: u64,
-    /// Memory limit per algorithm in bytes
+    /// Memory limit per algorithm in bytes.
     pub memory_limit: u64,
 }
 
-/// Job template information from pool
+/// Pool job template, typically derived from mining.notify.
 #[derive(Debug, Clone)]
 pub struct JobTemplate {
-    /// Block height
+    /// Block height (changes with new blocks).
     pub height: u64,
-    /// Job identifier
-    pub job_id: String, // Changed to String to match Stratum job_id
-    /// Pre-proof-of-work header
+    /// Pool-side job identifier (e.g. hex string).
+    pub job_id: String,
+    /// Pre-proof-of-work header.
     pub pre_pow: String,
-    /// Difficulty target
-    pub difficulty: f64, // Changed to f64 for pool difficulty
+    /// Pool difficulty (e.g. 16.0).
+    pub difficulty: f64,
 }
 
-/// Pool type for solution formatting
+/// Pool type, used for formatting share submissions.
 #[derive(Debug, Clone, Copy)]
 pub enum PoolType {
     /// Standard Stratum protocol with mining.subscribe
@@ -65,121 +53,79 @@ pub enum PoolType {
     /// Custom JSON-RPC format
     JsonRpc,
 }
-
 impl Default for PoolType {
-    fn default() -> Self {
-        Self::Stratum
-    }
+    fn default() -> Self { PoolType::Stratum }
 }
 
-/// Solution with calculated difficulty
+/// Wraps a mined solution and its calculated difficulty.
 #[derive(Debug, Clone)]
 pub struct SolutionWithDifficulty {
-    /// Original solution
+    /// Original solution.
     pub solution: Solution,
-    /// Calculated difficulty of this solution
+    /// Calculated pool difficulty.
     pub difficulty: f64,
 }
 
-/// GPU compute pipeline supporting multiple algorithms with OpenCL backend
+/// Compute pipeline for managing GPU jobs, stats, and pool interface.
 pub struct GpuCompute {
-    /// OpenCL mining backend (real implementation)
     opencl_backend: OpenClBackend,
-    /// GPU memory information
     memory_info: GpuMemoryInfo,
-    /// Currently loaded algorithm
     current_algorithm: Option<Algorithm>,
-    /// Current job template from pool
     current_job: Option<JobTemplate>,
-    /// Mining statistics
     stats: ComputeStats,
 }
 
-/// Mining performance statistics
+/// Performance and share-finding statistics for mining jobs.
 #[derive(Debug, Clone, Default)]
 pub struct ComputeStats {
-    /// Total mining attempts
+    /// Total mining attempts.
     pub attempts: u64,
-    /// Total solutions found
+    /// Total solutions found.
     pub solutions_found: u64,
-    /// Total nonces processed
+    /// Total nonces processed.
     pub nonces_processed: u64,
-    /// Average mining time per attempt (ms)
+    /// Average mining time per attempt (ms).
     pub avg_mining_time_ms: f64,
-    /// Success rate (solutions found / attempts)
+    /// Success rate (solutions found / attempts).
     pub success_rate: f64,
-    /// Current mining algorithm
+    /// Current mining algorithm.
     pub current_algorithm: Option<Algorithm>,
 }
 
 impl GpuCompute {
-    /// Create a new GPU compute instance with auto-detection
-    /// 
-    /// Automatically detects the best GPU, validates capabilities,
-    /// and initializes the OpenCL backend for real mining.
+    /// Initialize a new GPU mining pipeline with best available hardware.
+    ///
+    /// This probes the best GPU, selects the best algorithm, and initializes the OpenCL backend.
     pub async fn new() -> Result<Self, Graxil29Error> {
         tracing::info!("Initializing OpenCL-based GPU compute pipeline");
-        
-        // Initialize OpenCL backend with default configuration
+
         let opencl_backend = OpenClBackend::new()
             .map_err(|e| Graxil29Error::Gpu(format!("OpenCL initialization failed: {}", e)))?;
-        
-        // Get device capabilities for memory info
+
         let device_caps = opencl_backend.device_info();
         let memory_usage = opencl_backend.memory_usage();
-        
-        let memory_info = GpuMemoryInfo {
-            total_memory: device_caps.global_memory,
-            available_memory: device_caps.global_memory - memory_usage.buffer_memory_used as u64,
-            memory_limit: (device_caps.global_memory * 8) / 10, // Use 80% of total memory
-        };
-        
-        // Log GPU capabilities
-        tracing::info!("Selected GPU: {} ({:.1}GB VRAM)", 
-            device_caps.name, 
-            device_caps.global_memory as f64 / (1024.0 * 1024.0 * 1024.0)
-        );
-        
-        // Determine and log supported algorithms
-        let supported_algorithms = Self::detect_supported_algorithms(&memory_info);
-        tracing::info!("Supported algorithms: {:?}", supported_algorithms);
-        
-        if supported_algorithms.is_empty() {
-            return Err(Graxil29Error::Gpu(
-                "GPU does not meet minimum requirements for any algorithm".to_string()
-            ));
-        }
-        
-        Ok(Self {
-            opencl_backend,
-            memory_info,
-            current_algorithm: None,
-            current_job: None,
-            stats: ComputeStats::default(),
-        })
-    }
-    
-    /// Create GPU compute with custom OpenCL configuration
-    pub async fn with_config(config: OpenClConfig) -> Result<Self, Graxil29Error> {
-        tracing::info!("Initializing OpenCL compute with custom config");
-        
-        let opencl_backend = OpenClBackend::with_config(config)
-            .map_err(|e| Graxil29Error::Gpu(format!("OpenCL initialization failed: {}", e)))?;
-        
-        let device_caps = opencl_backend.device_info();
-        let memory_usage = opencl_backend.memory_usage();
-        
+
         let memory_info = GpuMemoryInfo {
             total_memory: device_caps.global_memory,
             available_memory: device_caps.global_memory - memory_usage.buffer_memory_used as u64,
             memory_limit: (device_caps.global_memory * 8) / 10,
         };
-        
-        tracing::info!("Custom GPU: {} ({:.1}GB VRAM)", 
-            device_caps.name, 
+
+        tracing::info!(
+            "Selected GPU: {} ({:.1}GB VRAM)",
+            device_caps.name,
             device_caps.global_memory as f64 / (1024.0 * 1024.0 * 1024.0)
         );
-        
+
+        let supported_algorithms = Self::detect_supported_algorithms(&memory_info);
+        tracing::info!("Supported algorithms: {:?}", supported_algorithms);
+
+        if supported_algorithms.is_empty() {
+            return Err(Graxil29Error::Gpu(
+                "GPU does not meet minimum requirements for any algorithm".to_string(),
+            ));
+        }
+
         Ok(Self {
             opencl_backend,
             memory_info,
@@ -188,26 +134,55 @@ impl GpuCompute {
             stats: ComputeStats::default(),
         })
     }
-    
-    /// Set current job template from pool
+
+    /// Create GPU compute with explicit OpenCL configuration.
+    pub async fn with_config(config: OpenClConfig) -> Result<Self, Graxil29Error> {
+        tracing::info!("Initializing OpenCL compute with custom config");
+
+        let opencl_backend = OpenClBackend::with_config(config)
+            .map_err(|e| Graxil29Error::Gpu(format!("OpenCL initialization failed: {}", e)))?;
+
+        let device_caps = opencl_backend.device_info();
+        let memory_usage = opencl_backend.memory_usage();
+
+        let memory_info = GpuMemoryInfo {
+            total_memory: device_caps.global_memory,
+            available_memory: device_caps.global_memory - memory_usage.buffer_memory_used as u64,
+            memory_limit: (device_caps.global_memory * 8) / 10,
+        };
+
+        tracing::info!(
+            "Custom GPU: {} ({:.1}GB VRAM)",
+            device_caps.name,
+            device_caps.global_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+
+        Ok(Self {
+            opencl_backend,
+            memory_info,
+            current_algorithm: None,
+            current_job: None,
+            stats: ComputeStats::default(),
+        })
+    }
+
+    /// Set the current pool job. Only the latest job is tracked and mined.
     pub fn set_job_template(&mut self, job: JobTemplate) {
         tracing::debug!("Setting job template: height={}, job_id={}", job.height, job.job_id);
         self.current_job = Some(job);
     }
-    
-    /// Universal mining function supporting both algorithms with REAL implementation
-    /// 
-    /// Now returns solutions with calculated difficulty for proper pool submission
-    /// 
+
+    /// Core mining function: mines the current (latest) pool job only.
+    ///
     /// # Arguments
-    /// * `algorithm` - Mining algorithm (Cuckaroo29 or Cuckatoo32)
-    /// * `header_hash` - Block header hash (32 bytes)
-    /// * `start_nonce` - Starting nonce value
-    /// * `nonce_count` - Number of nonces to process (user-configurable)
-    /// * `pool_difficulty` - Pool target difficulty (e.g., 16.0)
-    /// 
+    /// * `algorithm` - Algorithm to mine.
+    /// * `header_hash` - 32-byte header for edge/key generation.
+    /// * `start_nonce` - First nonce to try.
+    /// * `nonce_count` - How many nonces to process in this batch.
+    /// * `pool_difficulty` - Pool share difficulty (e.g., 16.0).
+    ///
     /// # Returns
-    /// * `Vec<SolutionWithDifficulty>` - Solutions that meet pool difficulty
+    /// Vector of solutions (nonce, cycle) meeting pool difficulty.
     pub async fn mine_algorithm(
         &mut self,
         algorithm: Algorithm,
@@ -219,8 +194,7 @@ impl GpuCompute {
         let start_time = std::time::Instant::now();
         self.stats.attempts += 1;
         self.stats.nonces_processed += nonce_count;
-        
-        // Validate algorithm support
+
         if !self.supports_algorithm(algorithm) {
             return Err(Graxil29Error::Gpu(format!(
                 "Algorithm {:?} not supported by current GPU (need {}GB+ VRAM)",
@@ -231,313 +205,299 @@ impl GpuCompute {
                 }
             )));
         }
-        
-        // Update current algorithm
+
         self.current_algorithm = Some(algorithm);
         self.stats.current_algorithm = Some(algorithm);
-        
-        tracing::debug!("OpenCL mining: {} nonces starting from {} with {:?} (pool difficulty: {})", 
-            nonce_count, start_nonce, algorithm, pool_difficulty);
-        
-        // Execute REAL mining using OpenCL backend (gets all valid cycles)
-        let all_solutions = self.opencl_backend.mine(&header_hash, start_nonce, nonce_count)
+
+        tracing::debug!(
+            "OpenCL mining: {} nonces from {} with {:?} (pool diff: {})",
+            nonce_count,
+            start_nonce,
+            algorithm,
+            pool_difficulty
+        );
+
+        let all_solutions = self
+            .opencl_backend
+            .mine(&header_hash, start_nonce, nonce_count)
             .map_err(|e| Graxil29Error::Gpu(format!("OpenCL mining failed: {}", e)))?;
-        
-        // Calculate difficulty for each solution and filter by pool requirement
-        let solutions = self.filter_and_calculate_difficulty(all_solutions, &header_hash, pool_difficulty)?;
-        
-        // Update statistics
+
+        let solutions =
+            self.filter_and_calculate_difficulty(all_solutions, &header_hash, pool_difficulty)?;
+
         let mining_time = start_time.elapsed().as_millis() as f64;
         self.stats.solutions_found += solutions.len() as u64;
-        
-        // Update average mining time
-        let new_avg = (self.stats.avg_mining_time_ms * (self.stats.attempts - 1) as f64 + mining_time) 
-                     / self.stats.attempts as f64;
-        self.stats.avg_mining_time_ms = new_avg;
-        
-        // Update success rate
-        self.stats.success_rate = self.stats.solutions_found as f64 / self.stats.attempts as f64;
-        
+
+        // Rolling average mining time.
+        self.stats.avg_mining_time_ms =
+            (self.stats.avg_mining_time_ms * (self.stats.attempts - 1) as f64 + mining_time)
+                / self.stats.attempts as f64;
+
+        self.stats.success_rate =
+            self.stats.solutions_found as f64 / self.stats.attempts as f64;
+
         let gps = nonce_count as f64 / (mining_time / 1000.0);
-        tracing::debug!("OpenCL mining completed: {} solutions meeting difficulty {:.2} in {:.1}ms ({:.1} Gps)", 
-            solutions.len(), pool_difficulty, mining_time, gps);
-        
+        tracing::debug!(
+            "OpenCL mining completed: {} solutions >= diff {:.2} in {:.1}ms ({:.2} Gps)",
+            solutions.len(),
+            pool_difficulty,
+            mining_time,
+            gps
+        );
+
         Ok(solutions)
     }
-    
-    /// Filter solutions by pool difficulty and calculate actual difficulty of each
-    /// 
-    /// This implements the same difficulty calculation as pools use to verify shares
+
+    /// Filters solutions by pool difficulty, returning only valid shares with calculated difficulties.
     fn filter_and_calculate_difficulty(
         &self,
         solutions: Vec<Solution>,
         header_hash: &[u8; 32],
         pool_difficulty: f64,
     ) -> Result<Vec<SolutionWithDifficulty>, Graxil29Error> {
-        let solutions_count = solutions.len();
-        if solutions.is_empty() {
-            return Ok(vec![]);
-        }
-        
-        let mut valid_solutions = Vec::new();
-        
+        let mut valid = Vec::new();
+
         for solution in &solutions {
-            // Calculate the actual difficulty of this solution using pool algorithm
-            let calculated_difficulty = self.calculate_solution_difficulty(&solution, header_hash)?;
-            
-            // Log difficulty with high precision
+            let calculated = self.calculate_solution_difficulty(solution, header_hash)?;
             tracing::debug!(
                 "Solution (nonce: {}): Difficulty: {:.2}",
-                solution.nonce, calculated_difficulty
+                solution.nonce,
+                calculated
             );
-            
-            // Check if this solution meets the pool difficulty requirement
-            if calculated_difficulty >= pool_difficulty {
-                valid_solutions.push(SolutionWithDifficulty {
+            if calculated >= pool_difficulty {
+                valid.push(SolutionWithDifficulty {
                     solution: solution.clone(),
-                    difficulty: calculated_difficulty,
+                    difficulty: calculated,
                 });
             }
         }
-        
-        tracing::debug!("Difficulty filter: {}/{} solutions meet pool difficulty {:.2}", 
-            valid_solutions.len(), solutions_count, pool_difficulty);
-        
-        Ok(valid_solutions)
+
+        tracing::debug!(
+            "Difficulty filter: {}/{} >= diff {:.2}",
+            valid.len(),
+            solutions.len(),
+            pool_difficulty
+        );
+
+        Ok(valid)
     }
-    
-    /// Calculate the actual difficulty of a solution using pool algorithm
-    /// 
-    /// This implements the same calculation pools use to verify shares.
-    /// Uses BLAKE2b-512 on unsorted cycle edges, with raw difficulty per Aeternity/GMiner.
+
+    /// Calculates share difficulty, per pool convention, on the cycle (BLAKE2b-512, little-endian).
     fn calculate_solution_difficulty(
         &self,
         solution: &Solution,
-        _header_hash: &[u8; 32], // Header used in edge generation, not difficulty hash
+        _header_hash: &[u8; 32],
     ) -> Result<f64, Graxil29Error> {
-        // Use unsorted cycle edges, per Aeternity/GMiner
         let mut hash_input = Vec::new();
         for &edge in &solution.cycle {
             hash_input.extend_from_slice(&edge.to_le_bytes());
         }
-        
-        // Log hash input in hex
-        tracing::debug!("Hash input for nonce {} (hex, unsorted cycle): {:?}", solution.nonce, hex::encode(&hash_input));
-        
-        // Compute BLAKE2b-512 hash
+
         let mut hasher = Blake2b512::new();
         hasher.update(&hash_input);
         let hash = hasher.finalize();
-        
-        // Log hash
-        tracing::debug!("BLAKE2b-512 hash for nonce {}: {}", solution.nonce, hex::encode(&hash));
-        
-        // Use first 8 bytes for difficulty
-        let hash_value = u64::from_le_bytes(hash[0..8].try_into()
-            .map_err(|e| Graxil29Error::Gpu(format!("Hash conversion failed: {}", e)))?);
-        
-        // Log hash value
-        tracing::debug!("Hash value for nonce {}: {}", solution.nonce, hash_value);
-        
-        // Calculate raw difficulty (no scaling, per GMiner)
+
+        let hash_value = u64::from_le_bytes(hash[0..8].try_into().map_err(|e| {
+            Graxil29Error::Gpu(format!("Hash conversion failed: {}", e))
+        })?);
+
         const MAX_TARGET: f64 = u64::MAX as f64;
         let difficulty = MAX_TARGET / (hash_value as f64 + 1.0);
-        
-        // Log difficulty
-        tracing::debug!("Difficulty for nonce {}: {:.2}", solution.nonce, difficulty);
-        
+
         Ok(difficulty)
     }
-    
-    /// Format solution for pool submission with support for different pool types
-    /// 
-    /// Supports both standard Stratum and custom JSON-RPC pool formats.
-    /// This is pool-agnostic - different pool types handled by stratum layer.
-    pub fn format_solution_for_pool(&self, solution: &Solution, pool_type: PoolType) -> Result<serde_json::Value, Graxil29Error> {
-        let job = self.current_job.as_ref()
+
+    /// Formats solution for pool submission. Handles both Stratum and JSON-RPC pools.
+    pub fn format_solution_for_pool(
+        &self,
+        solution: &Solution,
+        pool_type: PoolType,
+    ) -> Result<serde_json::Value, Graxil29Error> {
+        let job = self
+            .current_job
+            .as_ref()
             .ok_or_else(|| Graxil29Error::Gpu("No job template available".to_string()))?;
-        
-        let algorithm = self.current_algorithm
+
+        let algorithm = self
+            .current_algorithm
             .ok_or_else(|| Graxil29Error::Gpu("No algorithm selected".to_string()))?;
-        
+
         let edge_bits = match algorithm {
             Algorithm::Cuckaroo29 => 29,
             Algorithm::Cuckatoo32 => 32,
         };
-        
-        // Create submission based on pool type
+
         let submission = match pool_type {
-            PoolType::Stratum => {
-                // Standard Stratum format (compatible with most pools)
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "submit",
-                    "id": 3,
-                    "params": {
-                        "edge_bits": edge_bits,
-                        "height": job.height,
-                        "job_id": job.job_id,
-                        "nonce": solution.nonce,
-                        "pow": solution.cycle.to_vec()
-                    }
-                })
-            }
-            PoolType::JsonRpc => {
-                // Custom JSON-RPC format (for alternative pools)
-                serde_json::json!({
-                    "method": "solution",
-                    "params": {
-                        "algorithm": format!("Cuckaroo{}", edge_bits),
-                        "height": job.height,
-                        "job": job.job_id,
-                        "nonce": solution.nonce,
-                        "proof": solution.cycle.to_vec(),
-                        "difficulty": job.difficulty
-                    },
-                    "id": null
-                })
-            }
+            PoolType::Stratum => serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "submit",
+                "id": 3,
+                "params": {
+                    "edge_bits": edge_bits,
+                    "height": job.height,
+                    "job_id": job.job_id,
+                    "nonce": solution.nonce,
+                    "pow": solution.cycle.to_vec()
+                }
+            }),
+            PoolType::JsonRpc => serde_json::json!({
+                "method": "solution",
+                "params": {
+                    "algorithm": format!("Cuckaroo{}", edge_bits),
+                    "height": job.height,
+                    "job": job.job_id,
+                    "nonce": solution.nonce,
+                    "proof": solution.cycle.to_vec(),
+                    "difficulty": job.difficulty
+                },
+                "id": null
+            }),
         };
-        
-        tracing::debug!("Formatted solution for {:?} pool: nonce={}", pool_type, solution.nonce);
+
+        tracing::debug!(
+            "Formatted solution for {:?} pool: nonce={}",
+            pool_type,
+            solution.nonce
+        );
         Ok(submission)
     }
-    
-    /// Format solution with default pool type (backward compatibility)
-    pub fn format_solution(&self, solution: &Solution) -> Result<serde_json::Value, Graxil29Error> {
+
+    /// Formats solution for submission using the default pool type (Stratum).
+    pub fn format_solution(
+        &self,
+        solution: &Solution,
+    ) -> Result<serde_json::Value, Graxil29Error> {
         self.format_solution_for_pool(solution, PoolType::default())
     }
-    
-    /// Get GPU information
+
+    /// Returns info about the OpenCL device in use.
     pub fn gpu_info(&self) -> &DeviceCapabilities {
         self.opencl_backend.device_info()
     }
-    
-    /// Get memory information
+
+    /// Returns memory info struct for the GPU.
     pub fn memory_info(&self) -> &GpuMemoryInfo {
         &self.memory_info
     }
-    
-    /// Get memory usage statistics
+
+    /// Returns current buffer usage statistics.
     pub fn memory_usage(&self) -> MemoryUsage {
         self.opencl_backend.memory_usage()
     }
-    
-    /// Get supported algorithms based on GPU memory
+
+    /// Returns a list of all algorithms supported given available VRAM.
     pub fn supported_algorithms(&self) -> Vec<Algorithm> {
         Self::detect_supported_algorithms(&self.memory_info)
     }
-    
-    /// Check if specific algorithm is supported
+
+    /// Returns true if a specific algorithm is supported by this device.
     pub fn supports_algorithm(&self, algorithm: Algorithm) -> bool {
         self.opencl_backend.supports_algorithm(algorithm)
     }
-    
-    /// Get mining performance statistics
+
+    /// Returns all currently tracked performance statistics.
     pub fn stats(&self) -> &ComputeStats {
         &self.stats
     }
-    
-    /// Reset mining statistics
+
+    /// Resets mining stats and internal backend statistics.
     pub fn reset_stats(&mut self) {
         self.stats = ComputeStats::default();
         self.opencl_backend.reset_stats();
         tracing::info!("Mining statistics reset");
     }
-    
-    /// Get optimal batch size for current configuration
+
+    /// Returns the optimal batch size for current GPU/algorithm configuration.
     pub fn optimal_batch_size(&self) -> u64 {
         self.opencl_backend.optimal_batch_size()
     }
-    
-    /// Detect supported algorithms based on memory requirements
+
+    /// Determines supported mining algorithms for the device's available memory.
     fn detect_supported_algorithms(memory_info: &GpuMemoryInfo) -> Vec<Algorithm> {
         let mut supported = Vec::new();
         let memory_gb = memory_info.available_memory / (1024 * 1024 * 1024);
-        
-        // Cuckaroo29: requires 6GB minimum
+
         if memory_gb >= 6 {
             supported.push(Algorithm::Cuckaroo29);
-            tracing::info!("Cuckaroo29 supported ({} GB >= 6 GB required)", memory_gb);
+            tracing::info!("Cuckaroo29 supported ({} GB >= 6 GB)", memory_gb);
         } else {
-            tracing::warn!("Cuckaroo29 not supported ({} GB < 6 GB required)", memory_gb);
+            tracing::warn!("Cuckaroo29 not supported ({} GB < 6 GB)", memory_gb);
         }
-        
-        // Cuckatoo32: requires 11GB minimum
+
         if memory_gb >= 11 {
             supported.push(Algorithm::Cuckatoo32);
-            tracing::info!("Cuckatoo32 supported ({} GB >= 11 GB required)", memory_gb);
+            tracing::info!("Cuckatoo32 supported ({} GB >= 11 GB)", memory_gb);
         } else {
-            tracing::warn!("Cuckatoo32 not supported ({} GB < 11 GB required)", memory_gb);
+            tracing::warn!("Cuckatoo32 not supported ({} GB < 11 GB)", memory_gb);
         }
-        
+
         supported
     }
-    
-    /// Get NVIDIA VRAM size using nvml-wrapper (for enhanced memory detection)
-    /// 
-    /// This provides more accurate memory information than OpenCL queries
-    /// on NVIDIA GPUs like the 4060Ti 16GB.
+
+    /// Uses NVML to obtain the most accurate VRAM statistics on NVIDIA GPUs.
     pub fn get_nvidia_vram() -> Result<(u64, u64), Graxil29Error> {
         let nvml = Nvml::init()
             .map_err(|e| Graxil29Error::Gpu(format!("NVML init failed: {}", e)))?;
-        
+
         let device_count = nvml.device_count()
             .map_err(|e| Graxil29Error::Gpu(format!("NVML device count failed: {}", e)))?;
-        
+
         if device_count == 0 {
             return Err(Graxil29Error::Gpu("No NVIDIA GPU found".to_string()));
         }
-        
-        // Get first device (can be extended for multi-GPU setups)
+
         let device = nvml.device_by_index(0)
             .map_err(|e| Graxil29Error::Gpu(format!("NVML device access failed: {}", e)))?;
-        
+
         let memory = device.memory_info()
             .map_err(|e| Graxil29Error::Gpu(format!("NVML memory info failed: {}", e)))?;
-        
-        tracing::debug!("NVIDIA VRAM: {:.1}GB total, {:.1}GB free", 
+
+        tracing::debug!(
+            "NVIDIA VRAM: {:.1}GB total, {:.1}GB free",
             memory.total as f64 / (1024.0 * 1024.0 * 1024.0),
-            memory.free as f64 / (1024.0 * 1024.0 * 1024.0));
-        
+            memory.free as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+
         Ok((memory.total, memory.free))
     }
-    
-    /// Validate mining parameters before execution
+
+    /// Validates that mining parameters are supported on this device.
     pub fn validate_mining_params(
         &self,
         algorithm: Algorithm,
         nonce_count: u64,
     ) -> Result<(), Graxil29Error> {
-        // Check algorithm support
         if !self.supports_algorithm(algorithm) {
             return Err(Graxil29Error::Gpu(format!(
-                "Algorithm {:?} not supported by current GPU", algorithm
+                "Algorithm {:?} not supported by current GPU",
+                algorithm
             )));
         }
-        
-        // Check batch size limits
+
         let max_batch = self.optimal_batch_size();
-        if nonce_count > max_batch * 10 { // Allow up to 10 batches
-            tracing::warn!("Large nonce count ({}) may require multiple batches", nonce_count);
+        if nonce_count > max_batch * 10 {
+            tracing::warn!(
+                "Large nonce count ({}) may require multiple batches",
+                nonce_count
+            );
         }
-        
-        // Check memory availability
+
         let memory_usage = self.memory_usage();
         if memory_usage.memory_utilization > 0.9 {
-            tracing::warn!("High memory utilization ({:.1}%), performance may be affected", 
-                memory_usage.memory_utilization * 100.0);
+            tracing::warn!(
+                "High memory utilization ({:.1}%), performance may be affected",
+                memory_usage.memory_utilization * 100.0
+            );
         }
-        
+
         Ok(())
     }
-    
-    /// Get detailed performance report
+
+    /// Returns a full performance report struct.
     pub fn performance_report(&self) -> PerformanceReport {
         let opencl_stats = self.opencl_backend.stats();
-        let _trimming_stats = self.opencl_backend.trimming_stats();
         let device_info = self.gpu_info();
-        
+
         PerformanceReport {
             device_name: device_info.name.clone(),
             total_attempts: self.stats.attempts,
@@ -545,7 +505,8 @@ impl GpuCompute {
             total_nonces: self.stats.nonces_processed,
             success_rate: self.stats.success_rate,
             avg_mining_time_ms: self.stats.avg_mining_time_ms,
-            avg_trimming_time_ms: opencl_stats.total_trimming_time_ms as f64 / opencl_stats.attempts.max(1) as f64,
+            avg_trimming_time_ms: opencl_stats.total_trimming_time_ms as f64
+                / opencl_stats.attempts.max(1) as f64,
             avg_edges_remaining: opencl_stats.avg_edges_remaining,
             memory_utilization: self.memory_usage().memory_utilization,
             current_algorithm: self.stats.current_algorithm,
@@ -553,38 +514,41 @@ impl GpuCompute {
     }
 }
 
-/// Comprehensive performance report
+/// Printable mining performance and efficiency statistics.
 #[derive(Debug, Clone)]
 pub struct PerformanceReport {
-    /// GPU device name
+    /// Name of the GPU device.
     pub device_name: String,
-    /// Total mining attempts
+    /// Total mining attempts made.
     pub total_attempts: u64,
-    /// Total solutions found
+    /// Total solutions found.
     pub total_solutions: u64,
-    /// Total nonces processed
+    /// Total nonces processed.
     pub total_nonces: u64,
-    /// Solution success rate (0.0 to 1.0)
+    /// Success rate (solutions/attempts).
     pub success_rate: f64,
-    /// Average mining time per attempt (ms)
+    /// Average mining time per attempt (ms).
     pub avg_mining_time_ms: f64,
-    /// Average trimming time per attempt (ms)
+    /// Average trimming time per attempt (ms).
     pub avg_trimming_time_ms: f64,
-    /// Average edges remaining after trimming
+    /// Average edges remaining after trimming.
     pub avg_edges_remaining: f64,
-    /// Memory utilization (0.0 to 1.0)
+    /// Memory utilization (0.0 to 1.0).
     pub memory_utilization: f64,
-    /// Currently configured algorithm
+    /// Algorithm being mined, if set.
     pub current_algorithm: Option<Algorithm>,
 }
 
 impl PerformanceReport {
-    /// Print formatted performance report
+    /// Prints this performance report in a formatted, human-readable manner.
     pub fn print(&self) {
         println!("\nMining Performance Report");
         println!("{:=<50}", "");
         println!("GPU Device: {}", self.device_name);
-        println!("Algorithm: {:?}", self.current_algorithm.unwrap_or(Algorithm::Cuckaroo29));
+        println!(
+            "Algorithm: {:?}",
+            self.current_algorithm.unwrap_or(Algorithm::Cuckaroo29)
+        );
         println!("Total Attempts: {}", self.total_attempts);
         println!("Solutions Found: {}", self.total_solutions);
         println!("Success Rate: {:.2}%", self.success_rate * 100.0);
@@ -593,67 +557,83 @@ impl PerformanceReport {
         println!("Avg Edges Remaining: {:.0}", self.avg_edges_remaining);
         println!("Memory Utilization: {:.1}%", self.memory_utilization * 100.0);
         println!("Total Nonces: {}", self.total_nonces);
-        
+
         if self.total_nonces > 0 {
-            println!("Nonces per Solution: {:.0}", 
-                self.total_nonces as f64 / self.total_solutions.max(1) as f64);
+            println!(
+                "Nonces per Solution: {:.0}",
+                self.total_nonces as f64 / self.total_solutions.max(1) as f64
+            );
         }
     }
 }
 
-/// Utility functions for GPU compute
+/// Utility helpers for setup and benchmarking.
 pub mod utils {
     use super::*;
-    
-    /// Create GPU compute with recommended settings for specific hardware
-    pub async fn create_for_hardware(memory_gb: u64, vendor: GpuVendor) -> Result<GpuCompute, Graxil29Error> {
+
+    /// Creates a GPU compute instance with the recommended algorithm for the hardware.
+    ///
+    /// # Arguments
+    /// * `memory_gb` - Amount of GPU VRAM in GB.
+    /// * `vendor` - Preferred GPU vendor.
+    pub async fn create_for_hardware(
+        memory_gb: u64,
+        vendor: GpuVendor,
+    ) -> Result<GpuCompute, Graxil29Error> {
         let algorithm = if memory_gb >= 11 {
             Algorithm::Cuckatoo32
         } else {
             Algorithm::Cuckaroo29
         };
-        
+
         let config = OpenClConfig {
             preferred_vendor: Some(vendor),
             algorithm,
             enable_profiling: cfg!(feature = "profile"),
             ..Default::default()
         };
-        
+
         GpuCompute::with_config(config).await
     }
-    
-    /// Benchmark GPU performance for algorithm selection
+
+    /// Benchmarks all supported algorithms for this device.
+    ///
+    /// # Arguments
+    /// * `nonce_count` - How many nonces to process in each benchmark.
     pub async fn benchmark_algorithms(nonce_count: u64) -> Result<(), Graxil29Error> {
-        // Get supported algorithms first
         let supported = {
             let compute = GpuCompute::new().await?;
             compute.supported_algorithms()
         };
-        
+
         println!("Benchmarking supported algorithms...");
-        
+
         for algorithm in supported {
-            // Create fresh compute instance for each test to avoid move issues
             let mut compute = GpuCompute::new().await?;
-            
-            // Use real pool job header (job ID 1e7671 from ae.2miners.com)
+
+            // Example header hash (replace with real job header as needed)
             let test_header_hex = "a8db1910d85662f0167138c160c866683410c11f1ccfecb8ed8145716feb73e1";
-            let test_header = decode(test_header_hex)
+            let test_header = hex::decode(test_header_hex)
                 .map_err(|e| Graxil29Error::Gpu(format!("Failed to decode header: {}", e)))?
                 .try_into()
                 .map_err(|_| Graxil29Error::Gpu("Invalid header length".to_string()))?;
-            
+
             let start = std::time::Instant::now();
-            
-            // Use user-specified nonce count
-            let solutions = compute.mine_algorithm(algorithm, test_header, 0, nonce_count, 16.0).await?;
-            
+
+            let solutions = compute
+                .mine_algorithm(algorithm, test_header, 0, nonce_count, 16.0)
+                .await?;
+
             let time = start.elapsed().as_millis();
-            println!("  {:?}: {}ms for {} nonces, {} solutions", 
-                algorithm, time, nonce_count, solutions.len());
+            println!(
+                "  {:?}: {}ms for {} nonces, {} solutions",
+                algorithm,
+                time,
+                nonce_count,
+                solutions.len()
+            );
         }
-        
+
         Ok(())
     }
 }
@@ -661,16 +641,15 @@ pub mod utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_opencl_compute_initialization() {
-        // This test requires an OpenCL-capable GPU
         if let Ok(compute) = GpuCompute::new().await {
             assert!(!compute.supported_algorithms().is_empty());
             assert!(compute.memory_info().total_memory > 0);
         }
     }
-    
+
     #[test]
     fn test_algorithm_detection() {
         let memory_info_6gb = GpuMemoryInfo {
@@ -678,27 +657,25 @@ mod tests {
             available_memory: 6 * 1024 * 1024 * 1024,
             memory_limit: 5 * 1024 * 1024 * 1024,
         };
-        
+
         let algorithms = GpuCompute::detect_supported_algorithms(&memory_info_6gb);
         assert_eq!(algorithms, vec![Algorithm::Cuckaroo29]);
-        
+
         let memory_info_16gb = GpuMemoryInfo {
             total_memory: 16 * 1024 * 1024 * 1024,
             available_memory: 16 * 1024 * 1024 * 1024,
             memory_limit: 14 * 1024 * 1024 * 1024,
         };
-        
+
         let algorithms = GpuCompute::detect_supported_algorithms(&memory_info_16gb);
         assert_eq!(algorithms, vec![Algorithm::Cuckaroo29, Algorithm::Cuckatoo32]);
     }
-    
+
     #[test]
     fn test_pool_type_solution_formatting() {
-        // Test would require a full compute instance with job template
-        // This is a placeholder for integration testing
         assert_eq!(PoolType::default(), PoolType::Stratum);
     }
-    
+
     #[test]
     fn test_performance_report_display() {
         let report = PerformanceReport {
@@ -713,8 +690,7 @@ mod tests {
             memory_utilization: 0.75,
             current_algorithm: Some(Algorithm::Cuckaroo29),
         };
-        
-        // Test that print doesn't panic
+
         report.print();
     }
 }
